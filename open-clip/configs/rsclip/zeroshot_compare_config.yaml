@@ -1,0 +1,23 @@
+image_dir: ../../../RSICD_images
+json_path: ../../../dataset_rsicd.json
+dataset_split: test
+class_dir: ../../../txtclasses_rsicd
+
+models:
+  - label: non_finetuned_baseline
+    model_name: ViT-B-32
+    pretrained_tag: laion2b_s34b_b79k
+    checkpoint_type: openclip
+    checkpoint_path: ../../../weights/open_clip/ViT-B-32-laion2b_s34b_b79k.bin
+
+  - label: rsclip_mixed
+    model_name: ViT-B-32
+    pretrained_tag: laion2b_s34b_b79k
+    checkpoint_type: finetune
+    checkpoint_path: ../../../results/rsclip_pilot_mixed/ckp_best.pth
+
+  - label: rsclip_pseudo_only
+    model_name: ViT-B-32
+    pretrained_tag: laion2b_s34b_b79k
+    checkpoint_type: finetune
+    checkpoint_path: ../../../results/rsclip_pilot_pseudo_only/ckp_best.pth
