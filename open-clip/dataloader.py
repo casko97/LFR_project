@@ -7,6 +7,7 @@ IMPLEMENTING DATALOADER FOR RSICD DATASET
 """
 
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Callable
 from torch.utils.data import Dataset, DataLoader
@@ -18,6 +19,7 @@ import torch
 from torchvision import transforms
 import os
 from utils import _search_class, tokenize_texts, check_duplicates
+from prompt_utils import display_class_name
 
 
 CAPTION_POLICIES = frozenset({"all_unique", "random_one"})
@@ -50,6 +52,31 @@ def _load_transformed_image(image_dir: Path, filename: str, transform: Callable)
     """Open an RSICD image as RGB and apply caller-supplied preprocessing."""
     with Image.open(image_dir / filename) as image:
         return transform(image.convert("RGB"))
+
+
+def _validated_record_filename(
+    image_dir: Path,
+    record: Mapping[str, object],
+    dataset_name: str,
+) -> str:
+    """Validate and return the filename shared by RSICD dataset variants."""
+    filename = record.get("filename")
+    if not isinstance(filename, str) or not filename:
+        raise ValueError(f"{dataset_name} record has no valid filename: {record!r}")
+    image_path = image_dir / filename
+    if not image_path.is_file():
+        raise FileNotFoundError(f"RSICD image does not exist: {image_path}")
+    return filename
+
+
+def _validated_text_tokens(tokenizer: Callable, texts: Sequence[str]) -> torch.Tensor:
+    """Tokenize text rows and enforce the common OpenCLIP tensor contract."""
+    tokens = tokenizer(list(texts))
+    if not isinstance(tokens, torch.Tensor) or tokens.ndim != 2:
+        raise TypeError(
+            "Tokenizer must return a [num_texts, context_length] torch.Tensor"
+        )
+    return tokens
 
 
 class RSICDZeroShotDataset(Dataset):
@@ -131,6 +158,90 @@ class RSICDZeroShotDataset(Dataset):
         return image_tensor, self.filename_to_class[filename], filename
 
 
+class RSICDImageOnlyDataset(Dataset):
+    """Load a JSON split strictly as images and never expose its captions."""
+
+    def __init__(
+        self,
+        image_dir: str | Path,
+        json_path: str | Path,
+        transform: Callable,
+        split: str,
+        max_samples: int | None = None,
+    ) -> None:
+        self.image_dir, self.json_path = _validate_rsicd_paths(image_dir, json_path)
+        self.transform = transform
+        records = _load_rsicd_split(self.json_path, split)
+        if max_samples is not None:
+            if max_samples <= 0:
+                raise ValueError("max_samples must be positive")
+            records = records[:max_samples]
+        if not records:
+            raise ValueError(f"No {split!r}-split images found in: {self.json_path}")
+
+        self.filenames = [
+            _validated_record_filename(self.image_dir, record, "RSICD")
+            for record in records
+        ]
+
+    def __len__(self) -> int:
+        return len(self.filenames)
+
+    def __getitem__(self, index: int):
+        filename = self.filenames[index]
+        image = _load_transformed_image(self.image_dir, filename, self.transform)
+        return image, filename
+
+
+class RSICDPseudoPairDataset(Dataset):
+    """Materialize selected pseudo image/class pairs as CLIP prompt pairs."""
+
+    def __init__(
+        self,
+        image_dir: str | Path,
+        pseudo_pairs: Sequence[Mapping[str, object]],
+        transform: Callable,
+        tokenizer: Callable,
+        prompt_templates: Sequence[str],
+    ) -> None:
+        self.image_dir = Path(image_dir)
+        self.transform = transform
+        self.records = list(pseudo_pairs)
+        if not self.image_dir.is_dir():
+            raise FileNotFoundError(f"RSICD image directory does not exist: {self.image_dir}")
+        if not self.records:
+            raise ValueError("Pseudo-pair dataset has no records")
+        if not prompt_templates:
+            raise ValueError("At least one pseudo prompt template is required")
+        if any(template.count("{}") != 1 for template in prompt_templates):
+            raise ValueError("Every pseudo prompt template must contain exactly one '{}' placeholder")
+
+        self.filenames: list[str] = []
+        self.caption_tokens: list[torch.Tensor] = []
+        for record in self.records:
+            filename = _validated_record_filename(
+                self.image_dir, record, "Pseudo-pair"
+            )
+            class_name = record.get("class_name")
+            if not isinstance(class_name, str):
+                raise ValueError("Pseudo records require a string class_name value")
+            display_name = display_class_name(class_name)
+            tokens = _validated_text_tokens(
+                tokenizer,
+                [template.format(display_name) for template in prompt_templates],
+            )
+            self.filenames.append(filename)
+            self.caption_tokens.append(tokens)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __getitem__(self, index: int):
+        filename = self.filenames[index]
+        image = _load_transformed_image(self.image_dir, filename, self.transform)
+        return image, self.caption_tokens[index], filename, "pseudo"
+
+
 class RSICDSupervisedDataset(Dataset):
     """Captioned RSICD records for OpenCLIP supervised fine-tuning."""
 
@@ -165,11 +276,7 @@ class RSICDSupervisedDataset(Dataset):
         self.filenames: list[str] = []
         self.caption_tokens: list[torch.Tensor] = []
         for record in self.records:
-            filename = record.get("filename")
-            if not filename:
-                raise ValueError(f"RSICD record has no filename: {record!r}")
-            if not (self.image_dir / filename).is_file():
-                raise FileNotFoundError(f"RSICD image does not exist: {self.image_dir / filename}")
+            filename = _validated_record_filename(self.image_dir, record, "RSICD")
 
             captions = list(
                 dict.fromkeys(
@@ -181,11 +288,7 @@ class RSICDSupervisedDataset(Dataset):
             if not captions:
                 raise ValueError(f"RSICD image has no captions: {filename}")
 
-            tokens = self.tokenizer(captions)
-            if not isinstance(tokens, torch.Tensor) or tokens.ndim != 2:
-                raise TypeError(
-                    "Tokenizer must return a [num_captions, context_length] torch.Tensor"
-                )
+            tokens = _validated_text_tokens(self.tokenizer, captions)
             self.filenames.append(filename)
             self.caption_tokens.append(tokens)
 
@@ -264,9 +367,49 @@ def build_supervised_train_val_datasets(
     )
 
 
+class SourceTaggedDataset(Dataset):
+    """Attach a supervision-source label to a caption dataset."""
+
+    def __init__(self, dataset: Dataset, source: str) -> None:
+        self.dataset = dataset
+        self.source = source
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        image, captions, filename = self.dataset[index]
+        return image, captions, filename, self.source
+
+    def set_epoch(self, epoch: int) -> None:
+        setter = getattr(self.dataset, "set_epoch", None)
+        if setter is not None:
+            setter(epoch)
+
+
+def set_dataset_epoch(dataset: Dataset, epoch: int) -> None:
+    """Propagate an epoch into tagged/concatenated caption datasets."""
+    setter = getattr(dataset, "set_epoch", None)
+    if setter is not None:
+        setter(epoch)
+    children = getattr(dataset, "datasets", None)
+    if children is not None:
+        for child in children:
+            set_dataset_epoch(child, epoch)
+
+
 def collate_supervised_captions(batch):
-    """Stack images and flatten all captions with image-index targets."""
-    images, caption_batches, filenames = zip(*batch)
+    """Collate image-text pairs, preserving optional supervision sources."""
+    if not batch:
+        raise ValueError("Cannot collate an empty image-text batch")
+    if any(len(sample) not in {3, 4} for sample in batch):
+        raise ValueError(
+            "Samples must contain image, tokens, filename, and optional source"
+        )
+    normalized = [
+        sample if len(sample) == 4 else (*sample, "caption") for sample in batch
+    ]
+    images, caption_batches, filenames, sources = zip(*normalized)
     caption_to_image = torch.cat(
         [
             torch.full((captions.shape[0],), image_index, dtype=torch.long)
@@ -278,6 +421,7 @@ def collate_supervised_captions(batch):
         "texts": torch.cat(caption_batches),
         "caption_to_image": caption_to_image,
         "filenames": list(filenames),
+        "sources": list(sources),
     }
 
 #========= DATALOADER CLASS ========#

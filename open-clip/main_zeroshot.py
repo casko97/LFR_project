@@ -2,18 +2,18 @@
 
 import argparse
 import json
-import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import open_clip
 import torch
-import torch.nn.functional as functional
 import yaml
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader, Subset
 
 from dataloader import RSICDZeroShotDataset
+from prompt_utils import build_text_features as build_prompt_text_features
+from prompt_utils import display_class_name
 
 
 PROMPT_TEMPLATES = (
@@ -105,12 +105,6 @@ def apply_model_overrides(args: argparse.Namespace, model_config: ModelConfig) -
     )
 
 
-def display_class_name(class_name: str) -> str:
-    """Convert RSICD class filenames into readable prompt text."""
-    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", class_name)
-    return spaced.replace("_", " ").lower()
-
-
 def build_text_features(
     class_names: list[str],
     model: torch.nn.Module,
@@ -118,19 +112,9 @@ def build_text_features(
     device: torch.device,
 ) -> torch.Tensor:
     """Encode and ensemble the configured prompts for every RSICD class."""
-    prompts = [
-        template.format(display_class_name(class_name))
-        for class_name in class_names
-        for template in PROMPT_TEMPLATES
-    ]
-    text_tokens = tokenizer(prompts).to(device)
-
-    with torch.no_grad():
-        text_features = functional.normalize(model.encode_text(text_tokens), dim=-1)
-        text_features = text_features.reshape(
-            len(class_names), len(PROMPT_TEMPLATES), -1
-        ).mean(dim=1)
-    return functional.normalize(text_features, dim=-1)
+    return build_prompt_text_features(
+        class_names, PROMPT_TEMPLATES, model, tokenizer, device
+    )
 
 
 def list_pretrained() -> None:
