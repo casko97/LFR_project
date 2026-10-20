@@ -1,0 +1,38 @@
+# Local OpenCLIP initialization. Paths resolve relative to this file.
+model_name: ViT-B-32
+pretrained_tag: laion2b_s34b_b79k
+checkpoint_path: ../../../weights/open_clip/ViT-B-32-laion2b_s34b_b79k.bin
+
+# RSICD sources. Captions in the train split are deliberately ignored.
+image_dir: ../../../RSICD_images
+json_path: ../../../dataset_rsicd.json
+class_dir: ../../../txtclasses_rsicd
+captioned_split: val
+unlabeled_split: train
+supervised_train_fraction: 0.8
+seed: 42
+
+# Keep real captions in every curriculum round. Set false for pseudo-only RS-CLIP.
+retain_caption_supervision: true
+caption_policy: all_unique
+text_to_image_weighting: per_caption
+pseudo_prompt_templates:
+  - "This is an aerial image of a {}."
+
+# Small RSICD pilot. Use budget_mode: steps with budget: 300 for paper-style stages.
+budget_mode: epochs
+curriculum:
+  - top_k_per_class: 5
+    budget: 2
+  - top_k_per_class: 10
+    budget: 2
+  - top_k_per_class: 20
+    budget: 2
+
+batch_size: 16
+num_workers: 4
+learning_rate: 0.00003
+optimizer: adamw
+weight_decay: 0.1
+warmup_fraction: 0.1
+output_dir: ../../../results/rsclip_pilot_mixed
